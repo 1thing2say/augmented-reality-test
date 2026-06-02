@@ -289,11 +289,10 @@ class CustomARView: ARView, ARSessionDelegate, ARCoachingOverlayViewDelegate {
                 newObject = try await Entity(named: "toy_biplane_realistic.usdz") as! ModelEntity
             }
             
-            // --- Make the object grabbable ---
-            // newObject.generateCollisionShapes(recursive: true)
+            // --- Make the object grabbable and give it physics ---
+            newObject.generateCollisionShapes(recursive: true)
             newObject.components.set(GrabbableComponent())
             
-            /*
             if let model = newObject.model {
                 let material = PhysicsMaterialResource.generate(staticFriction: 0.8, dynamicFriction: 0.8, restitution: 0.2)
                 let body = try await PhysicsBodyComponent(
@@ -304,7 +303,6 @@ class CustomARView: ARView, ARSessionDelegate, ARCoachingOverlayViewDelegate {
                 )
                 newObject.components.set(body)
             }
-            */
             // ---
             
             let anchor = AnchorEntity(world: worldTransform)
@@ -382,21 +380,20 @@ class CustomARView: ARView, ARSessionDelegate, ARCoachingOverlayViewDelegate {
     func session(_ session: ARSession, didAdd anchors: [ARAnchor]) {
         for anchor in anchors {
             guard let planeAnchor = anchor as? ARPlaneAnchor else { continue }
-            // addOrUpdatePlaneCollision(for: planeAnchor)
+            addOrUpdatePlaneCollision(for: planeAnchor)
         }
     }
     
     func session(_ session: ARSession, didUpdate anchors: [ARAnchor]) {
         for anchor in anchors {
             guard let planeAnchor = anchor as? ARPlaneAnchor else { continue }
-            // addOrUpdatePlaneCollision(for: planeAnchor)
+            addOrUpdatePlaneCollision(for: planeAnchor)
         }
     }
     
     /// Creates or updates an invisible collision plane entity matching the detected ARPlaneAnchor.
     /// This gives dynamic physics objects (cubes, spheres, etc.) a surface to land on.
     private func addOrUpdatePlaneCollision(for planeAnchor: ARPlaneAnchor) {
-        /*
         let extent = planeAnchor.extent
         let width = CGFloat(extent.x)
         let depth = CGFloat(extent.z)
@@ -423,7 +420,6 @@ class CustomARView: ARView, ARSessionDelegate, ARCoachingOverlayViewDelegate {
             self.scene.addAnchor(anchorEntity)
             planeEntities[planeAnchor.identifier] = anchorEntity
         }
-        */
     }
     
     // MARK: - Hand Tracking and Gesture Logic
@@ -523,7 +519,9 @@ class CustomARView: ARView, ARSessionDelegate, ARCoachingOverlayViewDelegate {
             y: target.projected.y - handScreenPoint.y
         )
         
-        // Since physics is disabled, the entity's position is simply its world position
+        // Switch to kinematic FIRST so physics doesn't fight us while dragging
+        target.entity.physicsBody?.mode = .kinematic
+        
         let entityWorldPos = target.entity.position(relativeTo: nil)
         
         // Now compute grab distance from the entity's actual position
@@ -539,7 +537,7 @@ class CustomARView: ARView, ARSessionDelegate, ARCoachingOverlayViewDelegate {
     /// Releases the currently grabbed object and lets physics resume.
     private func releaseGrabbedObject() {
         if let grabbedModel = grabbedObject {
-            // grabbedModel.physicsBody?.mode = .dynamic
+            grabbedModel.physicsBody?.mode = .dynamic
             updateObjectColor(on: grabbedModel, isPinching: false)
             self.lastPlacedObject = grabbedModel
         }
