@@ -11,11 +11,25 @@ import ARKit
 import Vision
 import Combine // Import Combine to connect the ViewModel to the ARView
 
+// MARK: - Model Definitions
+
+/// An enum to represent the different types of models the user can place.
+enum ModelType: String, CaseIterable, Identifiable {
+    case cube = "Cube"
+    case sphere = "Sphere"
+    case custom = "Custom Model"
+    
+    var id: String { self.rawValue }
+}
+
+
 // MARK: - ViewModel
+
 /// An object to communicate state from the ARView to the SwiftUI HUD.
 class ARViewModel: ObservableObject {
     @Published var handDetected: Bool = false
     @Published var isPinching: Bool = false
+    @Published var selectedModelType: ModelType = .cube
 }
 
 
@@ -27,13 +41,18 @@ struct ContentView : View {
     @StateObject private var viewModel = ARViewModel()
     
     var body: some View {
-        ZStack(alignment: .topLeading) {
+        ZStack(alignment: .bottom) {
             // The AR View that renders the scene.
             ARViewContainer(viewModel: viewModel)
                 .edgesIgnoringSafeArea(.all)
             
-            // The HUD view, overlaid on top.
-            HUDView(viewModel: viewModel)
+            // A VStack to layer the HUD on top and the picker on the bottom.
+            VStack {
+                HUDView(viewModel: viewModel)
+                Spacer()
+                ModelPickerView(viewModel: viewModel)
+                    .padding(.bottom, 30) // Add padding from the bottom edge
+            }
         }
     }
 }
@@ -52,10 +71,29 @@ struct HUDView: View {
                 .font(.subheadline)
                 .foregroundColor(viewModel.isPinching ? .green : .white)
         }
+        .frame(maxWidth: .infinity, alignment: .leading) // Ensure it aligns left
         .padding()
         .background(Color.black.opacity(0.5))
         .cornerRadius(10)
-        .padding() // Add padding to position it from the edge of the screen
+        .padding([.top, .horizontal])
+    }
+}
+
+/// A new SwiftUI view for the model selection picker.
+struct ModelPickerView: View {
+    @ObservedObject var viewModel: ARViewModel
+    
+    var body: some View {
+        Picker("Select a Model", selection: $viewModel.selectedModelType) {
+            ForEach(ModelType.allCases) { type in
+                Text(type.rawValue).tag(type)
+            }
+        }
+        .pickerStyle(.segmented)
+        .padding()
+        .background(Color.black.opacity(0.5))
+        .cornerRadius(15)
+        .padding(.horizontal)
     }
 }
 
@@ -87,8 +125,8 @@ class CustomARView: ARView, ARSessionDelegate {
     // A single anchor for all hand-related entities.
     private let handAnchor = AnchorEntity()
     
-    // A reference to the cube, so we can change its color.
-    private var cubeEntity: ModelEntity!
+    // A reference to the last placed model, so we can change its color.
+    private var lastPlacedObject: ModelEntity?
 
     // The main Vision request for detecting hand poses.
     private let handPoseRequest = VNDetectHumanHandPoseRequest()
@@ -105,8 +143,9 @@ class CustomARView: ARView, ARSessionDelegate {
         config.planeDetection = [.horizontal]
         session.run(config)
         
-        // 3. Add the initial scene content and subscribers.
+        // 3. Add the initial scene content, gestures, and subscribers.
         setupScene()
+        setupGestures()
         subscribeToViewModel()
     }
     
@@ -114,9 +153,6 @@ class CustomARView: ARView, ARSessionDelegate {
         fatalError("init(coder:) has not been implemented")
     }
     
-    // ARView subclasses require this initializer.
-    // The 'override' keyword is removed to resolve the warning, as it's implied for required initializers.
-    // One of the duplicate declarations was also removed.
     @MainActor @preconcurrency required dynamic init(frame frameRect: CGRect) {
         fatalError("init(frame:) has not been implemented")
     }
@@ -124,17 +160,12 @@ class CustomARView: ARView, ARSessionDelegate {
     private func setupScene() {
         // Add the anchor for the hand joints to the scene.
         self.scene.addAnchor(handAnchor)
-
-        // Create the cube model you had before.
-        cubeEntity = ModelEntity(
-            mesh: .generateBox(size: 0.1, cornerRadius: 0.005),
-            materials: [SimpleMaterial(color: .gray, roughness: 0.15, isMetallic: true)]
-        )
-        
-        // Create an anchor for the cube and add it to the scene.
-        let anchor = AnchorEntity(.plane(.horizontal, classification: .any, minimumBounds: SIMD2<Float>(0.2, 0.2)))
-        anchor.addChild(cubeEntity)
-        self.scene.addAnchor(anchor)
+    }
+    
+    /// Adds a tap gesture recognizer to the view for placing objects.
+    private func setupGestures() {
+        let tapRecognizer = UITapGestureRecognizer(target: self, action: #selector(handleTap(_:)))
+        self.addGestureRecognizer(tapRecognizer)
     }
     
     /// Subscribes to changes in the ViewModel to update the AR scene.
@@ -143,12 +174,74 @@ class CustomARView: ARView, ARSessionDelegate {
         viewModel.$isPinching
             .receive(on: RunLoop.main) // Ensure UI updates happen on the main thread
             .sink { [weak self] isPinching in
-                guard let self = self, var material = self.cubeEntity.model?.materials[0] as? SimpleMaterial else { return }
-                // Change the cube color based on the pinch state.
-                material.color.tint = isPinching ? .green : .gray
-                self.cubeEntity.model?.materials[0] = material
+                self?.updateObjectColor(isPinching: isPinching)
             }
             .store(in: &cancellables)
+    }
+    
+    // MARK: - Object Placement
+    
+    @objc private func handleTap(_ recognizer: UITapGestureRecognizer) {
+        let tapLocation = recognizer.location(in: self)
+
+        // Raycast from the tap location to find a 3D point on a real-world surface.
+        guard let raycastResult = self.raycast(from: tapLocation, allowing: .estimatedPlane, alignment: .any).first else {
+            print("Tap raycast did not hit any surface.")
+            return
+        }
+
+        // Use a Task to handle the potentially asynchronous model loading.
+        Task {
+            await placeObject(of: viewModel.selectedModelType, at: raycastResult.worldTransform)
+        }
+    }
+    
+    @MainActor
+    private func placeObject(of type: ModelType, at worldTransform: simd_float4x4) async {
+        let newObject: ModelEntity
+        
+        do {
+            switch type {
+            case .cube:
+                newObject = ModelEntity(
+                    mesh: .generateBox(size: 0.1, cornerRadius: 0.005),
+                    materials: [SimpleMaterial(color: .gray, roughness: 0.15, isMetallic: true)]
+                )
+            case .sphere:
+                newObject = ModelEntity(
+                    mesh: .generateSphere(radius: 0.05),
+                    materials: [SimpleMaterial(color: .gray, roughness: 0.15, isMetallic: true)]
+                )
+            case .custom:
+                // IMPORTANT: Replace "MyModel.usdz" with your model file name.
+                newObject = try await ModelEntity.loadModel(named: "toy_biplane_realistic.usdz")
+            }
+            
+            // Place the object in the scene.
+            let anchor = AnchorEntity(world: worldTransform)
+            anchor.addChild(newObject)
+            self.scene.addAnchor(anchor)
+            
+            // Keep a reference to the last placed object.
+            self.lastPlacedObject = newObject
+            
+            // Set the initial color based on the current pinch state.
+            updateObjectColor(isPinching: viewModel.isPinching)
+
+        } catch {
+            print("Failed to load model for type \(type): \(error)")
+        }
+    }
+    
+    /// A helper function to change the model's color based on the pinch state.
+    private func updateObjectColor(isPinching: Bool) {
+        guard let object = self.lastPlacedObject else { return }
+        
+        // Create a new material to update the model's color.
+        if var material = object.model?.materials.first as? SimpleMaterial {
+            material.color.tint = isPinching ? .green : .gray
+            object.model?.materials[0] = material
+        }
     }
     
     // MARK: - ARSessionDelegate
