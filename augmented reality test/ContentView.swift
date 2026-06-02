@@ -8,36 +8,83 @@
 import SwiftUI
 import RealityKit
 import ARKit
-import Vision // We need to import the Vision framework for hand tracking
+import Vision
+import Combine // Import Combine to connect the ViewModel to the ARView
 
-/// The main SwiftUI view. It will host our AR experience.
+// MARK: - ViewModel
+/// An object to communicate state from the ARView to the SwiftUI HUD.
+class ARViewModel: ObservableObject {
+    @Published var handDetected: Bool = false
+    @Published var isPinching: Bool = false
+}
+
+
+// MARK: - SwiftUI Views
+
+/// The main SwiftUI view. It will host our AR experience and the HUD.
 struct ContentView : View {
+    // Create a state object for our ViewModel.
+    @StateObject private var viewModel = ARViewModel()
+    
     var body: some View {
-        // We use a UIViewRepresentable to wrap our custom ARView.
-        ARViewContainer().edgesIgnoringSafeArea(.all)
+        ZStack(alignment: .topLeading) {
+            // The AR View that renders the scene.
+            ARViewContainer(viewModel: viewModel)
+                .edgesIgnoringSafeArea(.all)
+            
+            // The HUD view, overlaid on top.
+            HUDView(viewModel: viewModel)
+        }
     }
 }
 
+/// A SwiftUI view that displays the status from the ARViewModel.
+struct HUDView: View {
+    @ObservedObject var viewModel: ARViewModel
+    
+    var body: some View {
+        VStack(alignment: .leading) {
+            Text(viewModel.handDetected ? "Hand Detected" : "Scanning for Hand...")
+                .font(.headline)
+                .foregroundColor(.white)
+            
+            Text("Pinching: \(viewModel.isPinching ? "YES" : "NO")")
+                .font(.subheadline)
+                .foregroundColor(viewModel.isPinching ? .green : .white)
+        }
+        .padding()
+        .background(Color.black.opacity(0.5))
+        .cornerRadius(10)
+        .padding() // Add padding to position it from the edge of the screen
+    }
+}
+
+
+// MARK: - ARView Implementation
+
 /// A UIViewRepresentable to bridge UIKit's ARView into a SwiftUI view.
 struct ARViewContainer: UIViewRepresentable {
+    @ObservedObject var viewModel: ARViewModel
     
     func makeUIView(context: Context) -> CustomARView {
-        // Create our custom AR view and return it.
-        return CustomARView(frame: .zero)
+        // Pass the ViewModel to our custom ARView.
+        return CustomARView(frame: .zero, viewModel: viewModel)
     }
     
     func updateUIView(_ uiView: CustomARView, context: Context) {}
-    
 }
 
 /// This is our custom ARView class. It handles the AR session,
 /// sets up the scene, and processes camera frames for hand tracking.
 class CustomARView: ARView, ARSessionDelegate {
     
+    private let viewModel: ARViewModel
+    private var cancellables: Set<AnyCancellable> = []
+    
     // A dictionary to hold the small spheres that visualize the hand joints.
     private var jointEntities: [VNHumanHandPoseObservation.JointName: ModelEntity] = [:]
     
-    // An anchor for all the joint entities.
+    // A single anchor for all hand-related entities.
     private let handAnchor = AnchorEntity()
     
     // A reference to the cube, so we can change its color.
@@ -46,11 +93,11 @@ class CustomARView: ARView, ARSessionDelegate {
     // The main Vision request for detecting hand poses.
     private let handPoseRequest = VNDetectHumanHandPoseRequest()
 
-    required init(frame frameRect: CGRect) {
+    init(frame frameRect: CGRect, viewModel: ARViewModel) {
+        self.viewModel = viewModel
         super.init(frame: frameRect)
         
         // 1. Set this view as the session's delegate.
-        // This allows us to receive AR a camera frame for each update.
         session.delegate = self
         
         // 2. Set up the AR session for world tracking.
@@ -58,18 +105,26 @@ class CustomARView: ARView, ARSessionDelegate {
         config.planeDetection = [.horizontal]
         session.run(config)
         
-        // 3. Add the initial scene content.
+        // 3. Add the initial scene content and subscribers.
         setupScene()
+        subscribeToViewModel()
     }
     
     @MainActor required dynamic init?(coder decoder: NSCoder) {
         fatalError("init(coder:) has not been implemented")
     }
     
+    // ARView subclasses require this initializer.
+    // The 'override' keyword is removed to resolve the warning, as it's implied for required initializers.
+    // One of the duplicate declarations was also removed.
+    @MainActor @preconcurrency required dynamic init(frame frameRect: CGRect) {
+        fatalError("init(frame:) has not been implemented")
+    }
+    
     private func setupScene() {
-        // Add the anchor for hand joint visualizations to the scene.
+        // Add the anchor for the hand joints to the scene.
         self.scene.addAnchor(handAnchor)
-        
+
         // Create the cube model you had before.
         cubeEntity = ModelEntity(
             mesh: .generateBox(size: 0.1, cornerRadius: 0.005),
@@ -82,27 +137,41 @@ class CustomARView: ARView, ARSessionDelegate {
         self.scene.addAnchor(anchor)
     }
     
+    /// Subscribes to changes in the ViewModel to update the AR scene.
+    private func subscribeToViewModel() {
+        // Listen for changes to the `isPinching` property.
+        viewModel.$isPinching
+            .receive(on: RunLoop.main) // Ensure UI updates happen on the main thread
+            .sink { [weak self] isPinching in
+                guard let self = self, var material = self.cubeEntity.model?.materials[0] as? SimpleMaterial else { return }
+                // Change the cube color based on the pinch state.
+                material.color.tint = isPinching ? .green : .gray
+                self.cubeEntity.model?.materials[0] = material
+            }
+            .store(in: &cancellables)
+    }
+    
     // MARK: - ARSessionDelegate
     
     func session(_ session: ARSession, didUpdate frame: ARFrame) {
-        // Get the current camera image as a CVPixelBuffer.
         let pixelBuffer = frame.capturedImage
-        
-        // Create a Vision image request handler for the current frame.
-        // We use .right orientation because AR apps are typically in landscape right.
         let handler = VNImageRequestHandler(cvPixelBuffer: pixelBuffer, orientation: .right, options: [:])
         
-        // The Vision request is computationally expensive, so we run it on a background thread.
         DispatchQueue.global(qos: .userInitiated).async {
             do {
-                // Perform the hand pose request.
                 try handler.perform([self.handPoseRequest])
                 
-                // If a hand is detected, get the first observation.
                 if let observation = self.handPoseRequest.results?.first {
-                    // Dispatch back to the main thread to update the AR scene.
                     DispatchQueue.main.async {
+                        self.viewModel.handDetected = true
                         self.processHand(observation: observation)
+                    }
+                } else {
+                    // No hand was detected in the frame.
+                    DispatchQueue.main.async {
+                        self.viewModel.handDetected = false
+                        self.viewModel.isPinching = false // Ensure pinch is reset
+                        self.hideAllJoints()
                     }
                 }
             } catch {
@@ -115,15 +184,12 @@ class CustomARView: ARView, ARSessionDelegate {
     
     private func processHand(observation: VNHumanHandPoseObservation) {
         do {
-            // Get all the recognized points for the hand.
             let recognizedPoints = try observation.recognizedPoints(.all)
             
-            // Visualize each joint with a sphere.
             for (jointName, point) in recognizedPoints where point.confidence > 0.3 {
                 updateJoint(jointName: jointName, at: point.location)
             }
             
-            // Check for a pinch gesture.
             checkForPinch(in: observation)
             
         } catch {
@@ -132,61 +198,47 @@ class CustomARView: ARView, ARSessionDelegate {
     }
     
     private func updateJoint(jointName: VNHumanHandPoseObservation.JointName, at location: CGPoint) {
-        // Use a raycast from the 2D screen point to find a 3D position in the scene.
         if let raycastResult = self.raycast(from: location, allowing: .estimatedPlane, alignment: .any).first {
             let jointEntity: ModelEntity
             
-            // If we already have an entity for this joint, use it.
             if let existingEntity = jointEntities[jointName] {
                 jointEntity = existingEntity
             } else {
-                // Otherwise, create a new small sphere entity.
                 let newEntity = ModelEntity(mesh: .generateSphere(radius: 0.005), materials: [SimpleMaterial(color: .cyan, isMetallic: false)])
-                handAnchor.addChild(newEntity) // Add it to our hand anchor.
-                jointEntities[jointName] = newEntity // Store it for future updates.
+                // Add the new joint entity to our hand-specific anchor.
+                handAnchor.addChild(newEntity)
+                jointEntities[jointName] = newEntity
                 jointEntity = newEntity
             }
-            
-            // Update the entity's transform to the new 3D position.
+            jointEntity.isEnabled = true
             jointEntity.transform = Transform(matrix: raycastResult.worldTransform)
         }
     }
     
-    private func checkForPinch(in observation: VNHumanHandPoseObservation) {
-        var isPinching = false
-        defer {
-            // `SimpleMaterial` is a struct (a value type). To modify a property,
-            // you must get a mutable copy, change it, and then assign the copy
-            // back to the entity's materials collection.
-            if var material = self.cubeEntity.model?.materials[0] as? SimpleMaterial {
-                material.color = .init(tint: isPinching ? UIColor.green : UIColor.gray)
-                self.cubeEntity.model?.materials[0] = material
-            }
-        }
-
-        do {
-            // Get the points for the thumb and index finger tips.
-            let thumbTip = try observation.recognizedPoint(.thumbTip)
-            let indexTip = try observation.recognizedPoint(.indexTip)
-
-            // Only proceed if the tips are detected with high confidence.
-            guard thumbTip.confidence > 0.5, indexTip.confidence > 0.5 else {
-                return
-            }
-
-            // Calculate the distance between the tips in 2D screen space.
-            let distance = thumbTip.location.distance(to: indexTip.location)
-
-            // If the distance is very small, we consider it a pinch.
-            if distance < 0.05 {
-                isPinching = true
-            }
-        } catch {
-            // It's normal for a joint to not be detected sometimes, so we can ignore this error.
-            // isPinching will remain false, and the defer block will reset the color.
+    /// Hides all the joint spheres when the hand is not visible.
+    private func hideAllJoints() {
+        for (_, entity) in jointEntities {
+            entity.isEnabled = false
         }
     }
+    
+    private func checkForPinch(in observation: VNHumanHandPoseObservation) {
+        // Use a guard to safely get the points, if they can't be found, reset the pinch state.
+        guard let thumbTip = try? observation.recognizedPoint(.thumbTip),
+              let indexTip = try? observation.recognizedPoint(.indexTip),
+              thumbTip.confidence > 0.5, indexTip.confidence > 0.5 else {
+            viewModel.isPinching = false
+            return
+        }
+
+        let distance = thumbTip.location.distance(to: indexTip.location)
+        
+        // Update the ViewModel based on the distance.
+        viewModel.isPinching = distance < 0.05
+    }
 }
+
+// MARK: - Helpers
 
 // A helper extension for calculating the distance between two CGPoints.
 extension CGPoint {
