@@ -23,7 +23,6 @@ struct GrabbableComponent: Component {}
 enum ModelType: String, CaseIterable, Identifiable {
     case cube = "Cube"
     case sphere = "Sphere"
-    case cylinder = "Cylinder"
     case custom = "Custom Model"
     
     var id: String { self.rawValue }
@@ -39,8 +38,32 @@ class ARViewModel: ObservableObject {
     @Published var selectedModelType: ModelType = .cube
     @Published var isCoachingActive: Bool = true // Tracks coaching overlay state
     
+    @Published var selectedCustomModelName: String = ""
+    @Published var availableCustomModels: [String] = []
+    
     /// A subject to broadcast requests to place an object.
     let placeObjectSubject = PassthroughSubject<Void, Never>()
+    
+    /// A subject to broadcast requests to clear all objects.
+    let clearObjectsSubject = PassthroughSubject<Void, Never>()
+    
+    init() {
+        loadAvailableModels()
+    }
+    
+    private func loadAvailableModels() {
+        // Find all USDZ and Reality files bundled with the app
+        let bundlePaths = Bundle.main.paths(forResourcesOfType: "usdz", inDirectory: nil) +
+                          Bundle.main.paths(forResourcesOfType: "reality", inDirectory: nil)
+        
+        // Extract just the filenames
+        let models = bundlePaths.map { ($0 as NSString).lastPathComponent }.sorted()
+        
+        self.availableCustomModels = models
+        if let first = models.first {
+            self.selectedCustomModelName = first
+        }
+    }
 }
 
 
@@ -64,17 +87,32 @@ struct ContentView : View {
                 
                 // Only show the placement UI when coaching is finished.
                 if !viewModel.isCoachingActive {
-                    // A new button to trigger object placement.
-                    Button(action: {
-                        viewModel.placeObjectSubject.send()
-                    }) {
-                        Image(systemName: "plus")
-                            .font(.system(size: 24, weight: .bold))
-                            .foregroundColor(.white)
-                            .padding(20)
-                            .background(Color.blue)
-                            .clipShape(Circle())
-                            .shadow(radius: 5, y: 2)
+                    HStack(spacing: 20) {
+                        // Button to clear objects
+                        Button(action: {
+                            viewModel.clearObjectsSubject.send()
+                        }) {
+                            Image(systemName: "trash")
+                                .font(.system(size: 24, weight: .bold))
+                                .foregroundColor(.white)
+                                .padding(20)
+                                .background(Color.red)
+                                .clipShape(Circle())
+                                .shadow(radius: 5, y: 2)
+                        }
+                        
+                        // A new button to trigger object placement.
+                        Button(action: {
+                            viewModel.placeObjectSubject.send()
+                        }) {
+                            Image(systemName: "plus")
+                                .font(.system(size: 24, weight: .bold))
+                                .foregroundColor(.white)
+                                .padding(20)
+                                .background(Color.blue)
+                                .clipShape(Circle())
+                                .shadow(radius: 5, y: 2)
+                        }
                     }
                     .padding(.bottom)
 
@@ -111,18 +149,65 @@ struct HUDView: View {
 /// A new SwiftUI view for the model selection picker.
 struct ModelPickerView: View {
     @ObservedObject var viewModel: ARViewModel
+    @State private var showingCustomModelPicker = false
     
     var body: some View {
-        Picker("Select a Model", selection: $viewModel.selectedModelType) {
-            ForEach(ModelType.allCases) { type in
-                Text(type.rawValue).tag(type)
+        HStack {
+            Picker("Select a Model", selection: $viewModel.selectedModelType) {
+                ForEach(ModelType.allCases) { type in
+                    Text(type.rawValue).tag(type)
+                }
+            }
+            .pickerStyle(.segmented)
+            
+            if viewModel.selectedModelType == .custom {
+                Button(action: {
+                    showingCustomModelPicker = true
+                }) {
+                    Image(systemName: "list.bullet")
+                        .font(.title2)
+                        .foregroundColor(.white)
+                        .padding(.leading, 8)
+                }
+                .sheet(isPresented: $showingCustomModelPicker) {
+                    CustomModelPickerSheet(viewModel: viewModel)
+                }
             }
         }
-        .pickerStyle(.segmented)
         .padding()
         .background(Color.black.opacity(0.5))
         .cornerRadius(15)
         .padding(.horizontal)
+    }
+}
+
+/// A scrollable sheet for selecting a custom model.
+struct CustomModelPickerSheet: View {
+    @ObservedObject var viewModel: ARViewModel
+    @Environment(\.presentationMode) var presentationMode
+    
+    var body: some View {
+        NavigationView {
+            List(viewModel.availableCustomModels, id: \.self) { model in
+                Button(action: {
+                    viewModel.selectedCustomModelName = model
+                    presentationMode.wrappedValue.dismiss()
+                }) {
+                    HStack {
+                        Text(model.replacingOccurrences(of: ".usdz", with: "").replacingOccurrences(of: ".reality", with: ""))
+                            .foregroundColor(.primary)
+                        Spacer()
+                        if viewModel.selectedCustomModelName == model {
+                            Image(systemName: "checkmark").foregroundColor(.blue)
+                        }
+                    }
+                }
+            }
+            .navigationTitle("Custom Models")
+            .navigationBarItems(trailing: Button("Done") {
+                presentationMode.wrappedValue.dismiss()
+            })
+        }
     }
 }
 
@@ -153,14 +238,17 @@ class CustomARView: ARView, ARSessionDelegate, ARCoachingOverlayViewDelegate {
     private var jointEntities: [VNHumanHandPoseObservation.JointName: ModelEntity] = [:]
     private let handAnchor = AnchorEntity()
     
-    private var grabbedObject: ModelEntity?
+    private var grabbedObject: Entity?
     private var latestHandObservation: VNHumanHandPoseObservation?
     
-    private var lastPlacedObject: ModelEntity?
+    private var lastPlacedObject: Entity?
     private let handPoseRequest = VNDetectHumanHandPoseRequest()
     
     /// Tracks invisible collision planes created from detected ARPlaneAnchors.
     private var planeEntities: [UUID: AnchorEntity] = [:]
+    
+    /// Tracks anchors of placed user objects so they can be cleared.
+    private var placedAnchors: [AnchorEntity] = []
     
     /// A flag to prevent processing multiple frames at once.
     private var isProcessingFrame = false
@@ -221,7 +309,7 @@ class CustomARView: ARView, ARSessionDelegate, ARCoachingOverlayViewDelegate {
             .sink { [weak self] isPinching in
                 guard let self = self else { return }
 
-                let targetModel: ModelEntity?
+                let targetModel: Entity?
                 if let grabbedModel = self.grabbedObject {
                     targetModel = grabbedModel
                 } else {
@@ -237,6 +325,12 @@ class CustomARView: ARView, ARSessionDelegate, ARCoachingOverlayViewDelegate {
         viewModel.placeObjectSubject
             .sink { [weak self] in
                 self?.placeObjectAtCenter()
+            }
+            .store(in: &cancellables)
+            
+        viewModel.clearObjectsSubject
+            .sink { [weak self] in
+                self?.clearAllObjects()
             }
             .store(in: &cancellables)
     }
@@ -274,7 +368,7 @@ class CustomARView: ARView, ARSessionDelegate, ARCoachingOverlayViewDelegate {
     
     @MainActor
     private func placeObject(of type: ModelType, at worldTransform: simd_float4x4) async {
-        let newObject: ModelEntity
+        let newObject: Entity
         
         do {
             switch type {
@@ -282,33 +376,50 @@ class CustomARView: ARView, ARSessionDelegate, ARCoachingOverlayViewDelegate {
                 newObject = ModelEntity(mesh: .generateBox(size: 0.1, cornerRadius: 0.005), materials: [SimpleMaterial(color: .gray, roughness: 0.15, isMetallic: true)])
             case .sphere:
                 newObject = ModelEntity(mesh: .generateSphere(radius: 0.05), materials: [SimpleMaterial(color: .gray, roughness: 0.15, isMetallic: true)])
-            case .cylinder:
-                newObject = ModelEntity(mesh: .generateCylinder(height: 0.1, radius: 0.05), materials: [SimpleMaterial(color: .gray, roughness: 0.15, isMetallic: true)])
             case .custom:
-                // Correctly load the model using RealityKit's asynchronous loading API
-                newObject = try await Entity(named: "toy_biplane_realistic.usdz") as! ModelEntity
+                // Load the model from the Assets catalog. In Xcode 15+, you can use the file name directly.
+                newObject = try await Entity(named: viewModel.selectedCustomModelName)
             }
             
             // --- Make the object grabbable and give it physics ---
-            newObject.generateCollisionShapes(recursive: true)
+            
+            // 1. Strip any pre-existing physics and collisions from the loaded USDZ.
+            func stripPhysics(from entity: Entity) {
+                entity.components.remove(PhysicsBodyComponent.self)
+                entity.components.remove(PhysicsMotionComponent.self)
+                entity.components.remove(CollisionComponent.self)
+                for child in entity.children { stripPhysics(from: child) }
+            }
+            stripPhysics(from: newObject)
+            
+            // 2. Compute local bounding box to create a guaranteed-convex collision shape.
+            // RealityKit requires simple/convex shapes for dynamic physics bodies. 
+            // Complex mesh collision shapes from `generateCollisionShapes` will silently fail to fall.
+            let bounds = newObject.visualBounds(relativeTo: newObject)
+            let boxShape = ShapeResource.generateBox(size: bounds.extents).offsetBy(translation: bounds.center)
+            
+            // 3. Apply the custom grabbable component.
             newObject.components.set(GrabbableComponent())
             
-            if let model = newObject.model {
-                let material = PhysicsMaterialResource.generate(staticFriction: 0.8, dynamicFriction: 0.8, restitution: 0.2)
-                let body = try await PhysicsBodyComponent(
-                    shapes: [try await .generateConvex(from: model.mesh)],
-                    mass: 1.0,
-                    material: material,
-                    mode: .dynamic
-                )
-                newObject.components.set(body)
-            }
+            // 4. Create the Collision and Dynamic Physics Body using the convex box shape.
+            newObject.components.set(CollisionComponent(shapes: [boxShape]))
+            
+            let material = PhysicsMaterialResource.generate(staticFriction: 0.8, dynamicFriction: 0.8, restitution: 0.2)
+            let body = PhysicsBodyComponent(
+                shapes: [boxShape],
+                mass: 1.0,
+                material: material,
+                mode: .dynamic
+            )
+            newObject.components.set(body)
+            newObject.components.set(PhysicsMotionComponent())
             // ---
             
             let anchor = AnchorEntity(world: worldTransform)
             anchor.addChild(newObject)
             self.scene.addAnchor(anchor)
             
+            self.placedAnchors.append(anchor)
             self.lastPlacedObject = newObject
             updateObjectColor(on: newObject, isPinching: viewModel.isPinching)
 
@@ -317,10 +428,32 @@ class CustomARView: ARView, ARSessionDelegate, ARCoachingOverlayViewDelegate {
         }
     }
     
-    private func updateObjectColor(on object: ModelEntity, isPinching: Bool) {
-        if var material = object.model?.materials.first as? SimpleMaterial {
+    /// Removes all user-placed objects from the scene.
+    private func clearAllObjects() {
+        for anchor in placedAnchors {
+            self.scene.removeAnchor(anchor)
+        }
+        placedAnchors.removeAll()
+        lastPlacedObject = nil
+        if grabbedObject != nil {
+            releaseGrabbedObject()
+        }
+    }
+    
+    private func getModelEntity(from entity: Entity) -> ModelEntity? {
+        if let model = entity as? ModelEntity { return model }
+        for child in entity.children {
+            if let model = getModelEntity(from: child) { return model }
+        }
+        return nil
+    }
+    
+    private func updateObjectColor(on object: Entity, isPinching: Bool) {
+        let targetModel = getModelEntity(from: object)
+        
+        if var material = targetModel?.model?.materials.first as? SimpleMaterial {
             material.color.tint = isPinching ? .green : .gray
-            object.model?.materials[0] = material
+            targetModel?.model?.materials[0] = material
         }
     }
     
@@ -481,13 +614,13 @@ class CustomARView: ARView, ARSessionDelegate, ARCoachingOverlayViewDelegate {
     private func tryGrabObject(handScreenPoint: CGPoint) {
         guard grabbedObject == nil else { return }
         
-        var closestMatch: (anchor: AnchorEntity, entity: ModelEntity, distance: CGFloat, projected: CGPoint)? = nil
+        var closestMatch: (anchor: AnchorEntity, entity: Entity, distance: CGFloat, projected: CGPoint)? = nil
 
         for anchor in self.scene.anchors {
             guard let anchorEntity = anchor as? AnchorEntity else { continue }
             for child in anchor.children {
-                guard let entity = child as? ModelEntity,
-                      entity.components.has(GrabbableComponent.self) else { continue }
+                let entity = child
+                guard entity.components.has(GrabbableComponent.self) else { continue }
                 
                 let worldPos = entity.position(relativeTo: nil)
                 guard let projected = self.project(worldPos) else { continue }
@@ -520,7 +653,10 @@ class CustomARView: ARView, ARSessionDelegate, ARCoachingOverlayViewDelegate {
         )
         
         // Switch to kinematic FIRST so physics doesn't fight us while dragging
-        target.entity.physicsBody?.mode = .kinematic
+        if var physicsBody = target.entity.components[PhysicsBodyComponent.self] as? PhysicsBodyComponent {
+            physicsBody.mode = .kinematic
+            target.entity.components.set(physicsBody)
+        }
         
         let entityWorldPos = target.entity.position(relativeTo: nil)
         
@@ -537,7 +673,10 @@ class CustomARView: ARView, ARSessionDelegate, ARCoachingOverlayViewDelegate {
     /// Releases the currently grabbed object and lets physics resume.
     private func releaseGrabbedObject() {
         if let grabbedModel = grabbedObject {
-            grabbedModel.physicsBody?.mode = .dynamic
+            if var physicsBody = grabbedModel.components[PhysicsBodyComponent.self] as? PhysicsBodyComponent {
+                physicsBody.mode = .dynamic
+                grabbedModel.components.set(physicsBody)
+            }
             updateObjectColor(on: grabbedModel, isPinching: false)
             self.lastPlacedObject = grabbedModel
         }
