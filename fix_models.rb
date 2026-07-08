@@ -1,11 +1,11 @@
 require 'xcodeproj'
 
-project_path = "augmented reality test.xcodeproj"
+project_path = "mixed reality test.xcodeproj"
 project = Xcodeproj::Project.open(project_path)
 target = project.targets.first
 
 # Add Models as a folder reference
-group = project.main_group.find_subpath("augmented reality test", false)
+group = project.main_group.find_subpath("mixed reality test", false)
 
 # Remove existing reference if any
 existing = group.children.find { |c| c.name == "Models" }

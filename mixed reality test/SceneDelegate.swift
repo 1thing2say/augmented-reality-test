@@ -1,6 +1,6 @@
 //
 //  SceneDelegate.swift
-//  augmented reality test
+//  mixed reality test
 //
 //  Created by my computer on 6/2/26.
 //
